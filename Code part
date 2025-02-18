@@ -1,0 +1,188 @@
+import torch
+import torch.nn as nn
+import torchvision
+import torchvision.transforms as transforms
+import numpy as np
+import matplotlib.pyplot as plt
+from foolbox import PyTorchModel
+from foolbox.attacks import FGSM, PGD
+import seaborn as sns
+from tqdm import tqdm
+import torch.optim as optim
+from sklearn.metrics import confusion_matrix
+import os
+from datetime import datetime
+
+class Config:
+    SEED = 42
+    BATCH_SIZE = 64
+    IMAGE_SIZE = 32
+    EPOCHS = 10
+    LEARNING_RATE = 0.001
+    EPSILON = 8/255
+    RESULTS_DIR = 'results'
+    
+    @staticmethod
+    def setup():
+        torch.manual_seed(Config.SEED)
+        np.random.seed(Config.SEED)
+        torch.backends.cudnn.deterministic = True
+        if not os.path.exists(Config.RESULTS_DIR):
+            os.makedirs(Config.RESULTS_DIR)
+
+class DataManager:
+    def __init__(self, batch_size=Config.BATCH_SIZE):
+        self.batch_size = batch_size
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        
+    def load_data(self):
+        trainset = torchvision.datasets.CIFAR10(
+            root='./data', train=True, download=True, transform=self.transform
+        )
+        testset = torchvision.datasets.CIFAR10(
+            root='./data', train=False, download=True, transform=self.transform
+        )
+        
+        trainloader = torch.utils.data.DataLoader(
+            trainset, batch_size=self.batch_size, shuffle=True, num_workers=2
+        )
+        testloader = torch.utils.data.DataLoader(
+            testset, batch_size=self.batch_size, shuffle=False, num_workers=2
+        )
+        
+        self.classes = ('plane', 'car', 'bird', 'cat', 'deer', 
+                   'dog', 'frog', 'horse', 'ship', 'truck')
+        
+        return trainloader, testloader
+
+class AdvancedAttackFramework:
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+        self.fmodel = PyTorchModel(model, bounds=(0, 1))
+        
+    def generate_attack(self, images, labels, method='pgd', **params):
+        attacks = {
+            'fgsm': self._fgsm_attack,
+            'pgd': self._pgd_attack,
+        }
+        return attacks[method](images, labels, **params)
+    
+    def _fgsm_attack(self, images, labels, eps=Config.EPSILON):
+        attack = FGSM()
+        images = images.to(self.device)
+        labels = labels.to(self.device)
+        _, adv_images, success = attack(self.fmodel, images, labels, epsilons=[eps])
+        return adv_images[0]
+    
+    def _pgd_attack(self, images, labels, eps=Config.EPSILON, steps=10):
+        attack = PGD()
+        images = images.to(self.device)
+        labels = labels.to(self.device)
+        _, adv_images, success = attack(self.fmodel, images, labels, epsilons=[eps])
+        return adv_images[0]
+
+class RobustDefenseModule:
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+        
+    def gaussian_noise(self, x, sigma=0.1):
+        return torch.clamp(x + torch.randn_like(x) * sigma, 0, 1)
+    
+    def adversarial_training(self, trainloader, attack_framework, epochs=Config.EPOCHS):
+        optimizer = optim.Adam(self.model.parameters(), lr=Config.LEARNING_RATE)
+        criterion = nn.CrossEntropyLoss()
+        
+        for epoch in range(epochs):
+            running_loss = 0.0
+            for i, (images, labels) in enumerate(tqdm(trainloader)):
+                images, labels = images.to(self.device), labels.to(self.device)
+                
+                adv_images = attack_framework.generate_attack(images, labels)
+                
+                optimizer.zero_grad()
+                outputs_clean = self.model(images)
+                outputs_adv = self.model(adv_images)
+                
+                loss = criterion(outputs_clean, labels) + criterion(outputs_adv, labels)
+                loss.backward()
+                optimizer.step()
+                
+                running_loss += loss.item()
+                
+            print(f'Epoch {epoch+1}, Loss: {running_loss/len(trainloader):.3f}')
+
+class RobustnessAnalyzer:
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+        self.results = {}
+        
+    def evaluate_model(self, dataloader, attack_framework=None, attack_type=None):
+        correct = 0
+        total = 0
+        self.model.eval()
+        
+        with torch.no_grad():
+            for images, labels in tqdm(dataloader):
+                images, labels = images.to(self.device), labels.to(self.device)
+                
+                if attack_framework and attack_type:
+                    images = attack_framework.generate_attack(images, labels, method=attack_type)
+                
+                outputs = self.model(images)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+                
+        return 100 * correct / total
+
+def main():
+    Config.setup()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Load data
+    data_manager = DataManager()
+    trainloader, testloader = data_manager.load_data()
+
+    # Initialize model
+    model = torchvision.models.resnet18(pretrained=True)
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    model.fc = nn.Linear(model.fc.in_features, 10)
+    model = model.to(device)
+
+    # Setup components
+    attack_framework = AdvancedAttackFramework(model, device)
+    defense_module = RobustDefenseModule(model, device)
+    robustness_analyzer = RobustnessAnalyzer(model, device)
+
+    # Baseline evaluation
+    print("Evaluating baseline performance...")
+    clean_acc = robustness_analyzer.evaluate_model(testloader)
+    robustness_analyzer.results['Clean'] = clean_acc
+    print(f"Clean accuracy: {clean_acc:.2f}%")
+
+    # Attack evaluation
+    print("Evaluating attack performance...")
+    for attack_type in ['fgsm', 'pgd']:
+        print(f"Testing {attack_type.upper()} attack...")
+        acc = robustness_analyzer.evaluate_model(testloader, attack_framework, attack_type)
+        robustness_analyzer.results[attack_type.upper()] = acc
+        print(f"{attack_type.upper()} accuracy: {acc:.2f}%")
+
+    # Save results
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    results_file = f'{Config.RESULTS_DIR}/results_{timestamp}.txt'
+    with open(results_file, 'w') as f:
+        f.write("Model Performance:\n")
+        for attack, acc in robustness_analyzer.results.items():
+            f.write(f'{attack}: {acc:.2f}%\n')
+
+    print(f"Results saved to {results_file}")
+
+if __name__ == "__main__":
+    main()
